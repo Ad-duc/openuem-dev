@@ -1,0 +1,217 @@
+# =============================================================================
+#  Workflow : build-images
+#  Purpose  : Build the OpenUEM development images from the forks and push
+#             them to GHCR. The forks stay untouched (no workflow, no extra
+#             Dockerfile in them), so their branches can be proposed upstream
+#             as they are.
+#  Images   : ghcr.io/<owner>/openuem-console:<tag>       (upstream Dockerfile)
+#             ghcr.io/<owner>/openuem-worker:<tag>        (upstream Dockerfile)
+#             ghcr.io/<owner>/openuem-dev-endpoint:<tag>  (endpoint/Dockerfile)
+#  Usage    : Actions tab -> build-images -> Run workflow. Give the branch to
+#             build for each fork. Set "use_local_libs" when a change spans the
+#             shared libraries (ent, nats, openuem-ansible-config, utils): the
+#             library forks are then checked out at the given refs and wired
+#             into each build with "go mod edit -replace".
+#  Actions  : versions checked on 2026-11-17 against the release pages
+#             https://github.com/actions/checkout/releases          (v7)
+#             https://github.com/actions/setup-go/releases          (v7)
+#             https://github.com/docker/setup-buildx-action/releases (v4)
+#             https://github.com/docker/login-action/releases        (v4)
+#             https://github.com/docker/build-push-action/releases   (v7)
+# =============================================================================
+
+name: build-images
+
+on:
+  workflow_dispatch:
+    inputs:
+      fork_owner:
+        description: "Owner of the forks (empty = owner of this repository)"
+        required: false
+        default: ""
+      console_ref:
+        description: "openuem-console branch, tag or SHA"
+        required: true
+        default: "main"
+      worker_ref:
+        description: "openuem-worker branch, tag or SHA"
+        required: true
+        default: "main"
+      agent_ref:
+        description: "openuem-agent branch, tag or SHA"
+        required: true
+        default: "main"
+      use_local_libs:
+        description: "Replace the shared libraries with the fork checkouts"
+        type: boolean
+        default: false
+      ent_ref:
+        description: "ent branch (only with use_local_libs)"
+        required: false
+        default: "main"
+      nats_ref:
+        description: "nats branch (only with use_local_libs)"
+        required: false
+        default: "main"
+      ansible_config_ref:
+        description: "openuem-ansible-config branch (only with use_local_libs)"
+        required: false
+        default: "main"
+      utils_ref:
+        description: "utils branch (only with use_local_libs)"
+        required: false
+        default: "main"
+      image_tag:
+        description: "Tag pushed to GHCR"
+        required: true
+        default: "dev"
+
+# Least privilege: read the repository, write packages only.
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-images-${{ inputs.image_tag }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: openuem-console
+            repo: openuem-console
+            ref_input: console_ref
+          - image: openuem-worker
+            repo: openuem-worker
+            ref_input: worker_ref
+          - image: openuem-dev-endpoint
+            repo: openuem-agent
+            ref_input: agent_ref
+    steps:
+      - name: Resolve owner and image name
+        id: vars
+        env:
+          FORK_OWNER_INPUT: ${{ inputs.fork_owner }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          owner="${FORK_OWNER_INPUT:-$REPO_OWNER}"
+          # GHCR requires a lowercase namespace.
+          echo "fork_owner=${owner}" >> "$GITHUB_OUTPUT"
+          echo "registry_owner=${REPO_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout openuem-dev (workflow, endpoint image files)
+        uses: actions/checkout@v7
+
+      - name: Checkout ${{ matrix.repo }}
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ steps.vars.outputs.fork_owner }}/${{ matrix.repo }}
+          ref: ${{ inputs[matrix.ref_input] }}
+          path: src/${{ matrix.repo }}
+
+      # ---- Optional: shared libraries from the forks --------------------------
+      - name: Checkout ent
+        if: ${{ inputs.use_local_libs }}
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ steps.vars.outputs.fork_owner }}/ent
+          ref: ${{ inputs.ent_ref }}
+          path: src/${{ matrix.repo }}/_deps/ent
+
+      - name: Checkout nats
+        if: ${{ inputs.use_local_libs }}
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ steps.vars.outputs.fork_owner }}/nats
+          ref: ${{ inputs.nats_ref }}
+          path: src/${{ matrix.repo }}/_deps/nats
+
+      - name: Checkout openuem-ansible-config
+        if: ${{ inputs.use_local_libs }}
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ steps.vars.outputs.fork_owner }}/openuem-ansible-config
+          ref: ${{ inputs.ansible_config_ref }}
+          path: src/${{ matrix.repo }}/_deps/openuem-ansible-config
+
+      - name: Checkout utils
+        if: ${{ inputs.use_local_libs }}
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ steps.vars.outputs.fork_owner }}/utils
+          ref: ${{ inputs.utils_ref }}
+          path: src/${{ matrix.repo }}/_deps/utils
+
+      - name: Set up Go (only to rewrite go.mod)
+        if: ${{ inputs.use_local_libs }}
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: src/${{ matrix.repo }}/go.mod
+          cache: false
+
+      # Directories starting with "_" are ignored by the Go tooling, so the
+      # library checkouts under _deps never end up in the package patterns of
+      # the module that embeds them.
+      - name: Point the module at the local libraries
+        if: ${{ inputs.use_local_libs }}
+        working-directory: src/${{ matrix.repo }}
+        run: |
+          for lib in ent nats openuem-ansible-config utils; do
+            rm -rf "_deps/${lib}/.git"
+            if grep -q "github.com/open-uem/${lib} " go.mod; then
+              go mod edit -replace "github.com/open-uem/${lib}=./_deps/${lib}"
+            fi
+          done
+          go mod tidy
+
+      # The official golang images run with GOTOOLCHAIN=local: a Dockerfile pinned
+      # to an older patch release than the "go" line of go.mod fails to build.
+      # Align the build image with go.mod (no-op when they already match).
+      - name: Align the Go build image with go.mod
+        if: ${{ matrix.image != 'openuem-dev-endpoint' }}
+        working-directory: src/${{ matrix.repo }}
+        run: |
+          gover="$(awk '/^go [0-9]/{print $2; exit}' go.mod)"
+          sed -i -E "s|^FROM golang:[0-9.]+ AS build|FROM golang:${gover} AS build|" Dockerfile
+          grep -n '^FROM' Dockerfile
+
+      # ---- Build and push ------------------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # console and worker: upstream Dockerfile, context = the fork checkout.
+      - name: Build and push ${{ matrix.image }} (upstream Dockerfile)
+        if: ${{ matrix.image != 'openuem-dev-endpoint' }}
+        uses: docker/build-push-action@v7
+        with:
+          context: src/${{ matrix.repo }}
+          push: true
+          tags: ghcr.io/${{ steps.vars.outputs.registry_owner }}/${{ matrix.image }}:${{ inputs.image_tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ inputs[matrix.ref_input] }}
+
+      # endpoint: Dockerfile of this repository, context = repository root so
+      # that both endpoint/ and src/openuem-agent are visible.
+      - name: Build and push ${{ matrix.image }} (endpoint Dockerfile)
+        if: ${{ matrix.image == 'openuem-dev-endpoint' }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: endpoint/Dockerfile
+          push: true
+          tags: ghcr.io/${{ steps.vars.outputs.registry_owner }}/${{ matrix.image }}:${{ inputs.image_tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ inputs[matrix.ref_input] }}
